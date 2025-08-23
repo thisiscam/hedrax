@@ -93,3 +93,24 @@ as long as it is finite and reasonly sized within the range of 32/64-bit integer
 
 The closed-form indexer works for domains that are convex and contiguous (i.e. the domain does not have strides),
 and where the inverse function for recovering each dimension is simpler than solving a quasi-quadratic equation.
+
+## FAQ
+
+### Why do I need this at all?
+
+Because you want to write wierdly, yet statically-shaped programs in JAX.
+
+### Why do I need the table indexer when I can simply build the lookup table myself?
+
+The table indexer automatically enumerates through the potentially non-convex domain,
+so that you don't have to think about how to enumerate through the domain yourself and doing the index encoding/decoding.
+
+It also have the potential benefit to be more efficient because ISL underneath can generate reasombly efficient
+enumeration order for the domain without introducing "holes" in the enumeration.
+
+### Why do I need the closed-form indexer when I can simply use the table indexer?
+
+Because it's cooler?
+Honestly, I have not tested the performance of the closed-form indexer yet, and the table indexer might be all you need.
+The closed-form indexer should save you O(M) memory, where $M$ is the number of lattice points in the domain,
+by changing each read to the table to some small arithmetic operations that decodes the index into the coordinates.
