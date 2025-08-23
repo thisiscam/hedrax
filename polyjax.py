@@ -1,17 +1,32 @@
-from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, NamedTuple, Callable, Union
+
 from fractions import Fraction
-from typing import Callable, Dict, List, Tuple, Optional
 import math
 import numpy as np
 import islpy as isl
 import jax.numpy as jnp
-
-# -----------------------------
-# Your existing table fallback (unchanged)
-# -----------------------------
+import jax
 
 
-def _fix_params(uset: isl.Set, params: Dict[str, int]) -> isl.Set:
+def _bind_parameters(uset: isl.Set, **params: Dict[str, int]) -> isl.Set:
+    """
+    Fix the parameters of the set to the given values.
+
+    Args:
+        uset: The set to fix the parameters of.
+        **params: The parameters to fix.
+
+    Returns:
+        The set with the parameters fixed.
+
+    Example:
+        >>> uset = isl.Set.read_from_str(ctx,
+        ...     "[N] -> { [i,j] : 0 <= j < i and 0 <= i < N }"
+        ... )
+        >>> uset = _bind_parameters(uset, N=10)
+        >>> print(uset)
+        { [i,j] : 0 <= j < i and 0 <= i < 10 }
+    """
     ctx = uset.get_ctx()
     sp = uset.get_space()
     for name, value in params.items():
@@ -24,93 +39,144 @@ def _fix_params(uset: isl.Set, params: Dict[str, int]) -> isl.Set:
     return uset.project_out_all_params()
 
 
-def _point_from_isl_point(p: isl.Point) -> Tuple[int, ...]:
+def _tuple_from_isl_point(p: isl.Point) -> Tuple[int, ...]:
+    """
+    Convert an isl.Point to a tuple of integers.
+
+    Args:
+        p: The isl.Point to convert.
+
+    Returns:
+        A tuple of integers representing the point.
+    """
     d = p.get_space().dim(isl.dim_type.set)
     return tuple(
         int(p.get_coordinate_val(isl.dim_type.set, t).to_python()) for t in range(d)
     )
 
 
-def _table_to_indices(domain_str: str, params: Dict[str, int]):
+class DomainIndexer(NamedTuple):
+    """
+    A compiled indexer for a domain's lattice points.
+
+    The compiled representation is a tuple of:
+    - addresses: a 1D array of integers representing the linearized addresses, or a range object when contiguous (closed-form solution).
+    - unravel: a function that maps addresses to multidimensional coordinates.
+    """
+
+    addresses: Union[jnp.ndarray, range]
+    unravel: Callable[[jnp.ndarray], jnp.ndarray]
+
+    @property
+    def is_closed_form(self) -> bool:
+        return isinstance(self.addresses, range)
+
+
+def compile_table_indexer(domain_str: str, **params: Dict[str, int]):
+    """
+    Compile a table-based indexer for the domain string.
+
+    Args:
+        domain_str: The domain string to convert.
+        **params: The parameters to fix.
+
+    Returns:
+        A `DomainIndexer` with explicit addresses and an `unravel` function.
+
+    Example:
+        >>> domain_str = "[N] -> { [i,j] : 0 <= j < i and 0 <= i < N }"
+        >>> sol = compile_table_indexer(domain_str, N=3)
+        >>> print(sol.addresses)
+        [ 0  1  2  3  5  6  7 10 11 15]
+        >>> print(sol.unravel(1))
+        [[0 1] [0 2] [0 3] [0 4] [1 2] [1 3] [1 4] [2 3] [2 4] [3 4]]
+    """
     us = isl.Set(domain_str)
-    us_fixed = _fix_params(us, params)
+    us_fixed = _bind_parameters(us, **params)
 
     pts: List[Tuple[int, ...]] = []
 
     def visit(p):
-        pts.append(_point_from_isl_point(p))
+        pts.append(_tuple_from_isl_point(p))
 
     us_fixed.foreach_point(visit)
 
     if not pts:
+        return DomainIndexer(
+            addresses=np.zeros((0,), dtype=np.uint8),
+            unravel=lambda addr: np.zeros(addr.shape + (0,), dtype=int),
+        )
 
-        def _unzips_empty(addr):
-            arr = np.asarray(addr)
-            return np.zeros(arr.shape + (0,), dtype=int)
-
-        return np.zeros((0,), dtype=np.uint8), _unzips_empty
-
-    d = len(pts[0])
-    L = np.array([min(p[t] for p in pts) for t in range(d)], dtype=int)
-    U = np.array([max(p[t] for p in pts) + 1 for t in range(d)], dtype=int)
-    M = U - L
-    S = np.empty(d, dtype=int)
+    d = len(pts[0])  # type: ignore
+    lower = np.array([min(p[t] for p in pts) for t in range(d)], dtype=int)  # type: ignore
+    upper = np.array([max(p[t] for p in pts) + 1 for t in range(d)], dtype=int)  # type: ignore
+    size = upper - lower
+    stride = np.empty(d, dtype=int)
     acc = 1
     for t in range(d - 1, -1, -1):
-        S[t] = acc
-        acc *= int(M[t])
+        stride[t] = acc
+        acc *= int(size[t])
 
     idx_dtype = np.dtype(int)
 
     def compress(x: Tuple[int, ...]) -> int:
-        return int(sum((x[t] - int(L[t])) * int(S[t]) for t in range(d)))
+        return int(sum((x[t] - int(lower[t])) * int(stride[t]) for t in range(d)))
 
     addrs = [compress(x) for x in pts]
     idx = np.asarray(addrs, dtype=idx_dtype)
 
-    S_jnp = jnp.asarray(S, dtype=int)
-    M_jnp = jnp.asarray(M, dtype=int)
-    L_jnp = jnp.asarray(L, dtype=int)
+    stride_jnp = jnp.asarray(stride, dtype=int)
+    size_jnp = jnp.asarray(size, dtype=int)
+    lower_jnp = jnp.asarray(lower, dtype=int)
 
-    def unzips(addr: jnp.ndarray) -> jnp.ndarray:
+    def unravel(addr: jnp.ndarray) -> jnp.ndarray:
         a = jnp.asarray(addr)
-        flat = a.reshape((-1,))
-        flat_i64 = flat.astype(int)
-        coords = ((flat_i64[:, None] // S_jnp[None, :]) % M_jnp[None, :]) + L_jnp[
+        flat = a.reshape((-1,)).astype(int)
+        coords = (flat[:, None] // stride_jnp[None, :]) % size_jnp[None, :] + lower_jnp[
             None, :
         ]
         return coords.reshape((*a.shape, d))
 
-    return Solution(idx=idx, unzips=unzips, closed_form=False)
+    return DomainIndexer(addresses=idx, unravel=unravel)
 
 
 # -----------------------------
-# Helpers for reading QPolynomials
+# Closed-form unrank
 # -----------------------------
 
 
-def _val_to_fraction(v: isl.Val) -> Fraction:
-    # isl.Val can be rational; safest is to parse its string form.
-    return Fraction(v.to_str())
-
-
-def _single_set_after_fix(domain_str: str, params: Dict[str, int]) -> isl.Set:
-    US = isl.Set(domain_str)
-    US = _fix_params(US, params)
-    return US
-
-
-def _dim_bounds_simple_hull(S: isl.Set, t: int) -> Tuple[int, int]:
-    Sh = S.simple_hull()
-    lo = int(Sh.to_set().dim_min_val(t).to_python())
-    hi = int(Sh.to_set().dim_max_val(t).to_python()) + 1  # exclusive
-    return lo, hi
-
-
-def _build_prefix_pwqp(S: isl.Set, t: int, xt_name: str) -> isl.UnionPwQPolynomial:
+def _prefix_count_pwqp(S: isl.Set, t: int, new_name: str) -> isl.PwQPolynomial:
     """
-    Build PwQPolynomial for prefix P_t(..., Xt): count of points with x_t < Xt.
-    Earlier set dims (0..t-1) are moved to params, and a fresh param Xt is added by name.
+    Construct a piecewise quasi-polynomial prefix counter P_t(..., Xt).
+
+    Given a set `S` with set dimensions x_0, ..., x_{d-1}, this returns an
+    `isl.PwQPolynomial` `P` such that, for each fixed choice of the earlier
+    coordinates x_0, ..., x_{t-1}, the original parameters of `S`, and a new
+    parameter `Xt`, `P` evaluates to the number of points in `S` whose t-th
+    coordinate is strictly less than `Xt`:
+
+    P(x_0, ..., x_{t-1}, params..., Xt) = | { x in S : x_t < Xt } |.
+
+    To expose the earlier coordinates as functional parameters, the set
+    dimensions 0..t-1 of `S` are moved to parameters, and a fresh parameter
+    named `new_name` is introduced for `Xt`. The returned polynomial has zero
+    set ("in") dimensions.
+
+    Args:
+        S: Input `isl.Set` whose lattice points are counted by the prefix.
+        t: Zero-based index of the set dimension to prefix on (0 <= t < dim(S)).
+        new_name: Name of the fresh parameter representing the bound `Xt`. Must
+            be distinct from existing parameter and set-dimension names.
+
+    Returns:
+        isl.PwQPolynomial: A piecewise quasi-polynomial in the parameters
+        (x_0, ..., x_{t-1}, original params of `S`, `Xt`) giving the count of
+        points in `S` with x_t < `Xt`. The result space has zero "in" dims.
+
+    Example:
+        >>> s = isl.Set("{ [i,j] : 0 <= j < i and 0 <= i < 10 }")
+        >>> _prefix_count_pwqp(s, t=0, new_name="i'")
+        [i'] -> { (1/2 * i' + 1/2 * i'^2) : 0 < i' <= 9 }
     """
     Sp = S
     # Move earlier set dims [0..t-1] to parameters so the prefix becomes a
@@ -121,16 +187,13 @@ def _build_prefix_pwqp(S: isl.Set, t: int, xt_name: str) -> isl.UnionPwQPolynomi
     Spp = Sp.flat_product(Sp)
     n_dim = Sp.dim(isl.dim_type.set)
     Spp = Spp.remove_dims(isl.dim_type.set, n_dim + 1, n_dim - 1).set_dim_name(
-        isl.dim_type.set, n_dim, xt_name
+        isl.dim_type.set, n_dim, new_name
     )
-    # add the constraint t < Xt
+    # add the constraint t <= Xt
     Spp = Spp.add_constraint(
         isl.Constraint.ineq_from_names(
             Spp.get_space(),
-            {
-                Spp.get_dim_name(isl.dim_type.set, 0): -1,
-                xt_name: 1,
-            },
+            {Spp.get_dim_name(isl.dim_type.set, 0): -1, new_name: 1, 1: 0},
         )
     )
     # move x_t to the last position of params
@@ -140,89 +203,45 @@ def _build_prefix_pwqp(S: isl.Set, t: int, xt_name: str) -> isl.UnionPwQPolynomi
     return Spp.card()
 
 
-@dataclass(frozen=True)
-class QuadPrefixRational:
-    """P(X) = (A X^2 + B X + C) / D, A,B,C,D ∈ Z, D>0."""
-
-    A: int
-    B: int
-    C: int
-    D: int
-
-    def eval(self, X: int) -> int:
-        return (self.A * X * X + self.B * X + self.C) // self.D
-
-    def invert(self, r: int, lo: int, hi: int) -> int:
-        A, B, C, D = self.A, self.B, self.C, self.D
-        if A == 0:
-            # linear fallback
-            if B <= 0:
-                return lo
-            x = (r * D - C) // B
-            x = max(lo, min(hi, x))
-            while self.eval(x) > r and x > lo:
-                x -= 1
-            while x + 1 <= hi and self.eval(x + 1) <= r:
-                x += 1
-            return x
-        disc = B * B - 4 * A * (C - r * D)
-        if disc < 0:
-            return lo
-        x0 = int((-B + math.sqrt(float(disc))) // (2 * A))
-        x = max(lo, min(hi, x0))
-        while self.eval(x) > r and x > lo:
-            x -= 1
-        while x + 1 <= hi and self.eval(x + 1) <= r:
-            x += 1
-        return x
-
-
-@dataclass(frozen=True)
-class LinPrefixRational:
-    """P(X) = (B X + C) / D."""
-
-    B: int
-    C: int
-    D: int
-
-    def eval(self, X: int) -> int:
-        return (self.B * X + self.C) // self.D
-
-    def invert(self, r: int, lo: int, hi: int) -> int:
-        if self.B == 0:
-            return lo
-        x = (r * self.D - self.C) // self.B
-        x = max(lo, min(hi, x))
-        while self.eval(x) > r and x > lo:
-            x -= 1
-        while x + 1 <= hi and self.eval(x + 1) <= r:
-            x += 1
-        return x
-
-
-Prefix = Tuple[
-    str, object
-]  # ("quad", QuadPrefixRational) or ("lin", LinPrefixRational)
-
-
-@dataclass(frozen=True)
-class Solution:
-    idx: np.ndarray
-    unzips: Callable[[np.ndarray], np.ndarray]
-    closed_form: bool
-
-
-def _extract_prefix_from_qpoly(
-    P_pwqp: isl.UnionPwQPolynomial, xt_name: str
-) -> Optional[Prefix]:
+class Monomial(NamedTuple):
     """
-    Inspect the (single-piece) QPolynomial and extract P(X) = (A X^2 + B X + C)/D in Xt,
-    rejecting if:
+    Integer monomial after clearing denominators: coeff * prod(prev_dims[i] ** exps[i]).
+
+    coeff: integer numerator after multiplying by common denominator D
+    exps: tuple of nonnegative integer exponents for earlier dims (length = t)
+    """
+
+    coeff: int
+    exps: Tuple[int, ...]
+
+
+class ParametricQuadraticPrefix(NamedTuple):
+    """
+    Parametric coefficients for P(X) = (A(X_prev) * X^2 + B(X_prev) * X + C(X_prev)) / D
+
+    deg2, deg1, deg0 hold monomials of earlier dims contributing to A, B, C respectively,
+    with a shared positive integer denominator D.
+    """
+
+    deg2: Tuple[Monomial, ...]
+    deg1: Tuple[Monomial, ...]
+    deg0: Tuple[Monomial, ...]
+    D: int
+    t: int
+
+
+def _extract_parametric_quadratic_prefix(
+    P_pwqp: isl.UnionPwQPolynomial, new_name: str
+) -> Optional[ParametricQuadraticPrefix]:
+    """
+    Inspect the (single-piece) QPolynomial and extract
+    P(X) = (A(prev)^2 * X^2 + B(prev) * X + C(prev)) / D,
+    allowing coefficients to depend on earlier dims (now parameters), but rejecting if:
       - multiple pieces
-      - any non-Xt param has positive exponent
       - any 'in' (set) dim has positive exponent
       - any 'div' dim has positive exponent (true quasi-polynomial residue dependence)
       - degree in Xt > 2
+    Coefficients are represented as lists of integer monomials with a shared denominator D.
     """
     pieces = P_pwqp.get_pieces()
     if len(pieces) != 1:
@@ -231,16 +250,20 @@ def _extract_prefix_from_qpoly(
 
     sp = qp.get_space()
     # Identify the Xt parameter index
-    xt_pos = sp.find_dim_by_name(isl.dim_type.param, xt_name)
+    xt_pos = sp.find_dim_by_name(isl.dim_type.param, new_name)
     if xt_pos < 0:
         return None
 
-    A = Fraction(0)
-    B = Fraction(0)
-    C = Fraction(0)
     n_in = sp.dim(isl.dim_type.in_)  # "in" dims (should be 0 here)
     n_par = sp.dim(isl.dim_type.param)
     n_div = sp.dim(isl.dim_type.div)
+    # Temporarily accumulate fractional monomials per degree
+    deg_to_monos: Dict[int, List[Tuple[Fraction, Tuple[int, ...]]]] = {
+        0: [],
+        1: [],
+        2: [],
+    }
+    denom_lcm = 1
 
     for term in qp.get_terms():
         # reject if any set/in dims present
@@ -251,90 +274,161 @@ def _extract_prefix_from_qpoly(
         for i in range(n_div):
             if term.get_exp(isl.dim_type.div, i) != 0:
                 return None
-        # check params: only Xt may have positive exponent; all others must be 0
+
+        # degree in Xt
         exp_xt = term.get_exp(isl.dim_type.param, xt_pos)
         if exp_xt < 0:
-            return None  # shouldn't happen
+            return None
+        if exp_xt > 2:
+            return None
+
+        # build exponent vector for earlier params (exclude Xt)
+        exps_prev: List[int] = []
         for p in range(n_par):
             if p == xt_pos:
                 continue
-            if term.get_exp(isl.dim_type.param, p) != 0:
-                return None  # depends on earlier dims → reject
+            exps_prev.append(term.get_exp(isl.dim_type.param, p))
 
-        # grab coefficient (exact rational)
-        coeff = _val_to_fraction(term.get_coefficient_val())
+        coeff_frac = Fraction(term.get_coefficient_val().to_str())
+        denom_lcm = math.lcm(denom_lcm, coeff_frac.denominator)
+        deg_to_monos[exp_xt].append((coeff_frac, tuple(exps_prev)))
 
-        # degree check + accumulation
-        if exp_xt == 0:
-            C += coeff
-        elif exp_xt == 1:
-            B += coeff
-        elif exp_xt == 2:
-            A += coeff
-        else:
-            return None  # degree > 2 → reject
+    # Normalize to integer monomials under common denominator
+    def _to_monomials(
+        items: List[Tuple[Fraction, Tuple[int, ...]]],
+    ) -> Tuple[Monomial, ...]:
+        return tuple(
+            Monomial(coeff=int(coeff_frac * denom_lcm), exps=exps)
+            for coeff_frac, exps in items
+        )
 
-    # Classify and normalize to integer numerator / common denominator D
-    if A == 0:
-        # linear/constant
-        Bf, Cf = B, C
-        if Bf == 0 and Cf == 0:
-            # degenerate zero; treat as linear with B=0 (always 0)
-            return ("lin", LinPrefixRational(B=0, C=0, D=1))
-        D = math.lcm(Bf.denominator, Cf.denominator)
-        Bn = int(Bf * D)
-        Cn = int(Cf * D)
-        # monotonicity: B >= 0 (prefix must be nondecreasing in X)
-        if Bn < 0:
-            return None
-        return ("lin", LinPrefixRational(B=Bn, C=Cn, D=D))
-    else:
-        # quadratic
-        D = math.lcm(A.denominator, math.lcm(B.denominator, C.denominator))
-        An = int(A * D)
-        Bn = int(B * D)
-        Cn = int(C * D)
-        # monotone requirement: An >= 0, and if An==0 then Bn>=0 (already handled)
-        if An < 0:
-            return None
-        return ("quad", QuadPrefixRational(A=An, B=Bn, C=Cn, D=D))
+    deg2 = _to_monomials(deg_to_monos[2])
+    deg1 = _to_monomials(deg_to_monos[1])
+    deg0 = _to_monomials(deg_to_monos[0])
+
+    t_inferred = n_par - 1  # number of earlier dims now as params
+    return ParametricQuadraticPrefix(
+        deg2=tuple(deg2), deg1=tuple(deg1), deg0=tuple(deg0), D=denom_lcm, t=t_inferred
+    )
 
 
-def _synthesize_closed_form_unzips(S: isl.Set) -> Optional[Solution]:
+def compile_closed_form_indexer(
+    domain_str: str, **params: Dict[str, int]
+) -> Optional[DomainIndexer]:
     """
     If every dim yields a single-piece polynomial prefix (degree<=2) in Xt only,
-    return (idx=arange(K), unzips(rank->coords)). Otherwise None.
+    return (addresses=arange(K), unravel(rank->coords)). Otherwise None.
     """
+    S = isl.Set(domain_str)
+    S = _bind_parameters(S, **params)
     d = S.dim(isl.dim_type.set)
-    per_dim: List[Prefix] = []
-    bounds: List[Tuple[int, int]] = []
+    per_dim: List[ParametricQuadraticPrefix] = []
+    # convert to BasicSet, otherwise reject
+    bs = S.get_basic_sets()
+    if len(bs) != 1:
+        return None
+    S = bs[0]
+    try:
+        S.get_div(0)  # check if any div
+        return None
+    except Exception:
+        pass
     for t in range(d):
-        xt_name = f"X{t}"
-        P_pwqp = _build_prefix_pwqp(S, t, xt_name)
-        pref = _extract_prefix_from_qpoly(P_pwqp, xt_name)
+        new_name = f"X{t}"
+        # reject any constraint has div
+        P_pwqp = _prefix_count_pwqp(S, t, new_name)
+        pref = _extract_parametric_quadratic_prefix(P_pwqp, new_name)
         if pref is None:
             return None
         per_dim.append(pref)
-        bounds.append(_dim_bounds_simple_hull(S, t))
 
     # total K and idx = arange(K)
     n_total = S.card().eval_with_dict({})
-    idx = np.arange(n_total, dtype=int)
 
-    def unzips(addr):
-        a = np.asarray(addr, dtype=np.int64).reshape(-1)
-        out = np.zeros((a.shape[0], d), dtype=np.int64)
-        for r_i, k in enumerate(a):
-            rem = int(k)
-            for t in range(d):
-                tag, obj = per_dim[t]
-                lo, hi = bounds[t]
-                x = obj.invert(rem, lo, hi - 1)
-                rem -= obj.eval(x)
-                out[r_i, t] = x
-        return out.reshape(np.asarray(addr).shape + (d,))
+    def _eval_monomials(monos: Tuple[Monomial, ...], prev: jnp.ndarray) -> jnp.ndarray:
+        # prev shape: (t,) possibly empty. Evaluate sum_i coeff_i * prod_j prev[j] ** exps[i, j]
+        if len(monos) == 0:
+            return jnp.array(0, dtype=int)
+        coeffs = jnp.asarray([m.coeff for m in monos], dtype=int)
+        exps_mat = jnp.asarray([m.exps for m in monos], dtype=int)
 
-    return Solution(idx=idx, unzips=unzips, closed_form=True)
+        # If there are no earlier dims, each monomial product is 1
+        def _products_no_prev(nrows: int) -> jnp.ndarray:
+            return jnp.ones((nrows,), dtype=int)
+
+        def _products_with_prev(
+            prev_vec: jnp.ndarray, exps: jnp.ndarray
+        ) -> jnp.ndarray:
+            bases = prev_vec[None, :]
+            powed = jnp.power(bases, exps)
+            return jnp.prod(powed, axis=1)
+
+        products = jax.lax.cond(
+            prev.size == 0,
+            lambda _: _products_no_prev(exps_mat.shape[0]),
+            lambda _: _products_with_prev(prev, exps_mat),
+            operand=None,
+        )
+        return jnp.sum(coeffs * products, dtype=int)
+
+    def _eval_coeffs(
+        prefix: ParametricQuadraticPrefix, prev: jnp.ndarray
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, int]:
+        A_num = _eval_monomials(prefix.deg2, prev)
+        B_num = _eval_monomials(prefix.deg1, prev)
+        C_num = _eval_monomials(prefix.deg0, prev)
+        return A_num, B_num, C_num, prefix.D
+
+    def _eval_prefix_count(
+        prefix: ParametricQuadraticPrefix, prev: jnp.ndarray, X: jnp.ndarray
+    ) -> jnp.ndarray:
+        X = jnp.asarray(X)
+        A_num, B_num, C_num, D = _eval_coeffs(prefix, prev)
+        return jnp.floor_divide(A_num * X * X + B_num * X + C_num, D)
+
+    def _invert_prefix_count(
+        prefix: ParametricQuadraticPrefix, prev: jnp.ndarray, r: jnp.ndarray
+    ) -> jnp.ndarray:
+        # Closed-form inversion using sqrt for quadratic and direct formula for linear.
+        r_arr = jnp.asarray(r)
+
+        A_num, B_num, C_num, D = _eval_coeffs(prefix, prev)
+        is_const = A_num == 0 and B_num == 0
+        # Handle linear vs quadratic using where to keep JAX-friendly control flow
+        is_linear = A_num == 0
+        # linear: x = floor((D*r - C)/B) + 1
+        x_lin = jnp.floor_divide(D * r_arr - C_num, B_num)
+        # quadratic: x = floor(( -B + sqrt(B^2 - 4*A*(C - D*r)) ) / (2*A)) + 1
+        disc = B_num * B_num - 4 * A_num * (C_num - D * r_arr)
+        root = jnp.sqrt(disc)
+        denom = 2.0 * A_num
+        x_quad = jnp.floor_divide(-B_num + root, denom)
+        x0 = jnp.where(is_const, 0, jnp.where(is_linear, x_lin, x_quad)) + 1
+        return x0.astype(int)
+
+    def _unravel_one(addr_scalar: jnp.ndarray) -> jnp.ndarray:
+        rem = jnp.asarray(addr_scalar)
+        xs = []
+        # Sequentially recover each coordinate; d is a Python int, so this loop is static.
+        for t in range(d):
+            obj = per_dim[t]
+            prev = (
+                jnp.asarray(xs, dtype=int)
+                if len(xs) > 0
+                else jnp.asarray([], dtype=int)
+            )
+            x_t = _invert_prefix_count(obj, prev, rem)
+            rem = rem - _eval_prefix_count(obj, prev, x_t - 1)
+            xs.append(x_t)
+        return jnp.stack(xs, axis=0).astype(int)
+
+    def unravel(addr):
+        a = jnp.asarray(addr)
+        flat = a.reshape((-1,))
+        coords = jax.vmap(_unravel_one)(flat)
+        return coords.reshape((*a.shape, d)).astype(int)
+
+    return DomainIndexer(addresses=range(n_total), unravel=unravel)
 
 
 # -----------------------------
@@ -342,20 +436,16 @@ def _synthesize_closed_form_unzips(S: isl.Set) -> Optional[Solution]:
 # -----------------------------
 
 
-def to_indices_hybrid(domain_str: str, params: Dict[str, int]):
+def compile_indexer(domain_str: str, **params: Dict[str, int]):
     """
     Try closed-form unrank: per-dim prefix is a single-piece polynomial (degree<=2)
-    in Xt only (no other params, no divs). If success, returns (idx=arange(K),
-    unzips(rank->coords)). Otherwise: fall back to table (idx=addresses, unzips(address->coords)).
+    in Xt only (no other params, no divs). If success, returns (addresses=arange(K),
+    unravel(rank->coords)). Otherwise: fall back to table (addresses=array, unravel(address->coords)).
     """
-    S = _single_set_after_fix(domain_str, params)
-    try:
-        cf = _synthesize_closed_form_unzips(S)
-    except Exception:
-        cf = None
+    cf = compile_closed_form_indexer(domain_str, **params)
     if cf is not None:
         return cf
-    return _table_to_indices(domain_str, params)
+    return compile_table_indexer(domain_str, **params)
 
 
 # -----------------------------
@@ -363,13 +453,15 @@ def to_indices_hybrid(domain_str: str, params: Dict[str, int]):
 # -----------------------------
 if __name__ == "__main__":
     # 2D triangle
-    domain = "[N] -> { [i,j] : 0 <= j < i and 0 <= i < N }"
-    sol = to_indices_hybrid(domain, {"N": 10})
-    print("triangle: K =", len(sol.idx), "closed_form =", sol.closed_form)
-    print("samples:", sol.unzips(sol.idx))
+    domain = "[N] -> { [i, j] : 0 <= j < i and 0 <= i < N and j % 2 = 0 }"
+    sol = compile_indexer(domain, N=10)
+    print("triangle: K =", len(sol.addresses), "closed_form =", sol.is_closed_form)
+    print(sol.unravel(35))
+    print("samples:", sol.unravel(sol.addresses))
 
-    # 3D triangle x line
-    domain3 = "[N] -> { [i,j,k] : 0 <= j < i and 0 <= i < N and 0 <= k < N }"
-    sol3 = to_indices_hybrid(domain3, {"N": 10})
-    print("tri x line: K =", len(sol3.idx), "closed_form =", sol3.closed_form)
-    print("samples:", sol3.unzips(sol3.idx))
+
+# 0  1 2 3 4 5 6 7 8 9
+# 10 11 12 13 14 15 16 17 18
+# 19 20 21 22 23 24 25 26
+# 27 28 29 30 31 32 33
+# 34 35 36 37 38 39
