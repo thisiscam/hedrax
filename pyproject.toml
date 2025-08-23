@@ -1,28 +1,16 @@
 [project]
-name = "polyjax"
+name = "hedrax"
 version = "0.1.0"
-description = "Add your description here"
+description = "Polyhedral index helper for static-shape programming in JAX."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "islpy-barvinok>=2025.2.5",
-    "jax>=0.7.0",
+    "jax>=0.7.1",
+    "numpy>=2.3.2",
 ]
-
-[project.optional-dependencies]
-# Upstream islpy (no Barvinok); works for enumeration-only use cases
-isl = []
-# Barvinok-enabled build published under a separate name to avoid conflicts
-# This package will be provided by your builder and published to PyPI.
-barvinok = [
-    "islpy-barvinok>=0.41.8",
-]
-
-[tool.uv.sources]
-islpy-barvinok = { path = "../islpy_barvinok_repo/build/wheelhouse-repaired/islpy_barvinok-2025.2.5-cp313-cp313-macosx_15_0_arm64.whl" }
 
 [dependency-groups]
 dev = [
     "pytest>=8.4.1",
 ]
-

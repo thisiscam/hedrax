@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import islpy as isl
 
-from polyjax import (
+from hedrax import (
     compile_indexer,
     compile_table_indexer,
     compile_closed_form_indexer,

@@ -72,7 +72,7 @@ class DomainIndexer(NamedTuple):
         return isinstance(self.addresses, range)
 
 
-def compile_table_indexer(domain_str: str, **params: Dict[str, int]):
+def compile_table_indexer(domain_str: str, **params: Dict[str, int]) -> DomainIndexer:
     """
     Compile a table-based indexer for the domain string.
 
@@ -394,16 +394,34 @@ def compile_closed_form_indexer(
 
         A_num, B_num, C_num, D = _eval_coeffs(prefix, prev)
         is_const = A_num == 0 and B_num == 0
-        # Handle linear vs quadratic using where to keep JAX-friendly control flow
+        # Handle linear vs quadratic using cond to keep JAX-friendly control flow
         is_linear = A_num == 0
-        # linear: x = floor((D*r - C)/B) + 1
-        x_lin = jnp.floor_divide(D * r_arr - C_num, B_num)
-        # quadratic: x = floor(( -B + sqrt(B^2 - 4*A*(C - D*r)) ) / (2*A)) + 1
-        disc = B_num * B_num - 4 * A_num * (C_num - D * r_arr)
-        root = jnp.sqrt(disc)
-        denom = 2.0 * A_num
-        x_quad = jnp.floor_divide(-B_num + root, denom)
-        x0 = jnp.where(is_const, 0, jnp.where(is_linear, x_lin, x_quad)) + 1
+
+        def _compute_x_lin(_: None) -> jnp.ndarray:
+            # x = floor((D*r - C)/B)
+            return jnp.floor_divide(D * r_arr - C_num, B_num).astype(int)
+
+        def _compute_x_quad(_: None) -> jnp.ndarray:
+            # x = floor(( -B + sqrt(B^2 - 4*A*(C - D*r)) ) / (2*A))
+            disc = B_num * B_num - 4 * A_num * (C_num - D * r_arr)
+            root = jnp.sqrt(disc)
+            denom = 2.0 * A_num
+            return jnp.floor_divide(-B_num + root, denom).astype(int)
+
+        x_nonconst = jax.lax.cond(
+            is_linear,
+            _compute_x_lin,
+            _compute_x_quad,
+            operand=None,
+        )
+
+        x_base = jax.lax.cond(
+            is_const,
+            lambda _: jnp.zeros_like(r_arr, dtype=int),
+            lambda _: x_nonconst,
+            operand=None,
+        )
+        x0 = x_base + 1
         return x0.astype(int)
 
     def _unravel_one(addr_scalar: jnp.ndarray) -> jnp.ndarray:
@@ -453,15 +471,13 @@ def compile_indexer(domain_str: str, **params: Dict[str, int]):
 # -----------------------------
 if __name__ == "__main__":
     # 2D triangle
-    domain = "[N] -> { [i, j] : 0 <= j < i and 0 <= i < N and j % 2 = 0 }"
+    domain = "[N] -> { [i, j] : i + 10 <= j < 2 * i + 10 and 1 <= i < N + 1}"
     sol = compile_indexer(domain, N=10)
     print("triangle: K =", len(sol.addresses), "closed_form =", sol.is_closed_form)
     print(sol.unravel(35))
     print("samples:", sol.unravel(sol.addresses))
 
-
-# 0  1 2 3 4 5 6 7 8 9
-# 10 11 12 13 14 15 16 17 18
-# 19 20 21 22 23 24 25 26
-# 27 28 29 30 31 32 33
-# 34 35 36 37 38 39
+    sol1 = compile_table_indexer(domain, N=10)
+    print("triangle: K =", len(sol1.addresses), "closed_form =", sol1.is_closed_form)
+    print(sol1.unravel(35))
+    print("samples:", sol1.unravel(sol1.addresses))
