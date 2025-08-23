@@ -82,7 +82,7 @@ That's it!
 
 ## Implementation
 
-HedraX is implemented using the [isl](https://libisl.sourceforge.io/) library, a library for manipulating Presburger arithmetic.
+HedraX is implemented using the [islpy](https://github.com/inducer/islpy) library, a library for manipulating Presburger arithmetic.
 There are two main indexers:
 
 1. A table-based indexer based on enumerating the lattice points of the domain, then building a lookup table.
