@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Polyhedral index helper for static-shape programming in JAX."
 license = {file = "LICENSE"}
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.9"
 dependencies = [
     "islpy-barvinok>=2025.2.5",
     "jax>=0.7.1",
