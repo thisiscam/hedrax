@@ -393,7 +393,7 @@ def compile_closed_form_indexer(
         r_arr = jnp.asarray(r)
 
         A_num, B_num, C_num, D = _eval_coeffs(prefix, prev)
-        is_const = A_num == 0 and B_num == 0
+        is_const = (A_num == 0) & (B_num == 0)
         # Handle linear vs quadratic using cond to keep JAX-friendly control flow
         is_linear = A_num == 0
 
