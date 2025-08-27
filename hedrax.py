@@ -6,6 +6,7 @@ import numpy as np
 import islpy as isl
 import jax.numpy as jnp
 import jax
+from jax import lax
 
 
 def _bind_parameters(uset: isl.Set, **params: Dict[str, int]) -> isl.Set:
@@ -466,6 +467,43 @@ def compile_indexer(domain_str: str, **params: Dict[str, int]):
     return compile_table_indexer(domain_str, **params)
 
 
+def foreach(constr: str, **params: Dict[str, int]):
+    """
+    A decorator that applies a function to each element in a domain.
+
+    Args:
+        constr: The constraint string of the domain. The variables must be the arguments of the wrapped function.
+        **params: The parameters to fix, same as `compile_table_indexer`.
+
+    Returns:
+        Use as a decorator to a function. The result of the function applied to each element in the domain.
+
+    Example:
+        >>> N = 10
+        >>> r = jax.array_ref(jnp.zeros(N))
+        >>> @foreach(f"0 <= j < i < {N}")
+        ... def _(i, j):
+        ...   r[i] += jnp.sin(i) * jnp.cos(j)**2
+        >>> print(r)
+        [ 0.          0.00000000  0.00000000  0.00000000  0.00000000  0.00000000
+          0.00000000  0.00000000  0.00000000  0.00000000]
+    """
+
+    def decorator(body: Callable[[int, ...], None]):
+        coordinate_names = [
+            name
+            for name in body.__code__.co_varnames
+            if name not in ["self", "args", "kwargs"]
+        ]
+        # format the constr into a domain string
+        domain_str = f"{{ [{', '.join(coordinate_names)}] : {constr} }}"
+        addresses, unravel = compile_table_indexer(domain_str, **params)
+        _, res = lax.scan(lambda _, elts: (None, body(*unravel(elts))), None, addresses)
+        return res
+
+    return decorator
+
+
 # -----------------------------
 # Demo
 # -----------------------------
@@ -481,3 +519,18 @@ if __name__ == "__main__":
     print("triangle: K =", len(sol1.addresses), "closed_form =", sol1.is_closed_form)
     print(sol1.unravel(35))
     print("samples:", sol1.unravel(sol1.addresses))
+
+    N = 10
+    r = jax.array_ref(jnp.zeros(N))
+
+    @foreach(f"0 <= j < i < {N}")
+    def _(i, j):
+        r[i] += jnp.sin(i) * jnp.cos(j) ** 2
+
+    rp = jax.array_ref(jnp.zeros(N))
+    for i in range(N):
+        for j in range(i):
+            rp[i] += jnp.sin(i) * jnp.cos(j) ** 2
+
+    print(r)
+    print(rp)
